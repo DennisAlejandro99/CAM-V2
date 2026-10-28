@@ -16,7 +16,7 @@
     .head p{font-size:13px;line-height:1.5;color:#e0efff;margin:0}
     .panel{background:#fff;border:1px solid #dfe7f2;padding:15px;border-radius:14px;box-shadow:0 8px 28px rgba(15,34,63,.05);margin-bottom:12px}
     #reader{width:100%;min-height:200px;border-radius:11px;overflow:hidden;background:#07172b;display:flex;align-items:center;justify-content:center;color:#c4d5e5}
-    #reader video{object-fit:cover!important}
+    #reader video{object-fit:contain!important;max-width:100%;max-height:100%}
     .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:12px 0}
     button,select{border:1px solid #cad7e8;border-radius:9px;font-size:14px;padding:11px 14px;background:#f5f8fc;color:#142840;min-height:42px}
     button{font-weight:800;cursor:pointer}
@@ -41,10 +41,12 @@
       <div class="row">
         <button class="primary" id="start" type="button">▶ Iniciar cámara</button>
         <button id="stop" type="button" disabled>■ Detener</button>
-        <select id="cameras" aria-label="Seleccionar cámara" title="Seleccionar cámara"><option value="">Cámara trasera (predeterminada)</option></select>
+        <select id="cameras" aria-label="Seleccionar cámara" title="Seleccionar cámara"><option value="rear">📷 Trasera (automática)</option><option value="front">🤳 Frontal</option></select>
+        <button id="repair" type="button" disabled>↻ Reparar imagen negra</button>
       </div>
       <div id="status" role="status" aria-live="polite">Para usar la cámara debes permitir su acceso en este navegador.</div>
       <div class="last"><div><div class="hint">Última lectura</div><div id="lastCode">—</div></div><button id="repeat" type="button" disabled>＋ Repetir código</button></div>
+      <p class="hint">Si la cámara trasera aparece negra, pulsa «Reparar imagen negra». También puedes elegir otra cámara trasera en el selector. La página debe estar en HTTPS y el permiso de cámara debe estar habilitado.</p>
       <p class="hint">Para escanear otra vez <b>el mismo código</b>, retíralo de la cámara durante un momento y vuelve a presentarlo. Si necesitas sumar otra unidad sin moverlo, pulsa «Repetir código» una sola vez. El programa evita contar múltiples veces la misma imagen.</p>
     </section>
     <p class="foot">La cámara se ejecuta solo en este navegador. No se suben imágenes ni vídeos a un servidor. El sistema principal debe permanecer abierto en la otra pestaña.</p>
@@ -54,12 +56,20 @@
   (function(){'use strict';
     const params=new URLSearchParams(location.search),token=params.get('intelsiSession')||'';
     const $=(id)=>document.getElementById(id);
-    const buttonStart=$('start'),buttonStop=$('stop'),repeat=$('repeat'),cameras=$('cameras');
+    const buttonStart=$('start'),buttonStop=$('stop'),buttonRepair=$('repair'),repeat=$('repeat'),cameras=$('cameras');
     const status=$('status'),last=$('lastCode');
-    let scanner=null,running=false,starting=false,lastSeen=0,lastSent=0,locked='',pending=false,lastRaw='',sentCount=0;
+    let scanner=null,running=false,starting=false,changing=false,lastSeen=0,lastSent=0,locked='',pending=false,lastRaw='',sentCount=0;
+    let availableCameras=[],repairIndex=0;
     const codeKey=(value)=>String(value||'').trim().replace(/['\u2018\u2019]/g,'-').toUpperCase();
+    const wait=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
     function feedback(text,type){status.className=type||'';status.textContent=String(text||'');}
-    function setButtons(){buttonStart.disabled=starting||running;buttonStop.disabled=!running;repeat.disabled=!running||!lastRaw||pending;}
+    function setButtons(){
+      buttonStart.disabled=starting||running||changing;
+      buttonStop.disabled=!running||starting||changing;
+      buttonRepair.disabled=!running||starting||changing;
+      cameras.disabled=starting||changing;
+      repeat.disabled=!running||!lastRaw||pending||changing;
+    }
     function report(raw,force){
       raw=String(raw||'').trim();if(!raw||raw.length>180||!window.opener||window.opener.closed){feedback('No hay conexión con Inventario. Regresa al sistema y abre de nuevo la cámara.','error');return;}
       const now=Date.now(),key=codeKey(raw);
@@ -70,16 +80,62 @@
       const thisTime=lastSent;
       setTimeout(()=>{if(pending&&lastSent===thisTime){pending=false;feedback('Sin confirmación del sistema. Verifica que Inventario siga abierto; no se repetirá automáticamente.','error');setButtons();}},6500);
     }
-    // Se rearma el mismo código solo cuando el lector dejó de reconocerlo un tiempo.
     function success(raw){
       const now=Date.now();
       if(locked===codeKey(raw)){lastSeen=now;return;}
       report(raw,false);
     }
     function notFound(){if(locked&&!pending&&Date.now()-lastSeen>1300)locked='';}
-    async function stop(){
-      if(scanner&&running){try{await scanner.stop();}catch(e){}}
-      running=false;starting=false;setButtons();feedback('Cámara detenida.','');
+    // enumerateDevices() no abre una SEGUNDA transmisión: a diferencia de
+    // Html5Qrcode.getCameras(), que puede cortar la cámara trasera ya iniciada.
+    async function refreshDevices(){
+      try{
+        const devices=await navigator.mediaDevices.enumerateDevices();
+        const found=devices.filter(d=>d.kind==='videoinput'&&d.deviceId);
+        availableCameras=found;
+        const selected=cameras.value;
+        cameras.innerHTML='';
+        for(const [value,label] of [['rear','📷 Trasera (automática)'],['front','🤳 Frontal']]){
+          const option=document.createElement('option');option.value=value;option.textContent=label;cameras.appendChild(option);
+        }
+        found.forEach((device,index)=>{
+          const option=document.createElement('option');option.value='id:'+device.deviceId;
+          option.textContent=device.label||('Cámara '+(index+1));cameras.appendChild(option);
+        });
+        cameras.value=Array.from(cameras.options).some(o=>o.value===selected)?selected:'rear';
+      }catch(e){ /* Si el navegador no permite enumerar, se mantienen frontal y trasera. */ }
+    }
+    function backDevices(){
+      const rear=availableCameras.filter(d=>/(back|rear|environment|trase|trasera|atrás|arrière|rück)/i.test(d.label||''));
+      // Priorizar la cámara principal sobre lentes macro, profundidad o ultra gran angular.
+      return rear.sort((a,b)=>Number(/(ultra|macro|depth|tele|0[.,]5)/i.test(a.label||''))-Number(/(ultra|macro|depth|tele|0[.,]5)/i.test(b.label||'')));
+    }
+    function cameraRequest(selection){
+      if(selection==='front')return {facingMode:'user'};
+      if(selection.startsWith('id:'))return selection.slice(3);
+      return {facingMode:'environment'};
+    }
+    function newScanner(){
+      return new Html5Qrcode('reader',{formatsToSupport:[
+        Html5QrcodeSupportedFormats.CODE_128,Html5QrcodeSupportedFormats.CODE_39,
+        Html5QrcodeSupportedFormats.CODE_93,Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.EAN_8,Html5QrcodeSupportedFormats.UPC_A,
+        Html5QrcodeSupportedFormats.UPC_E,Html5QrcodeSupportedFormats.ITF,
+        Html5QrcodeSupportedFormats.QR_CODE]});
+    }
+    const scanOptions={fps:9,qrbox:(w,h)=>({width:Math.max(150,Math.min(340,Math.floor(w*.8))),height:Math.max(110,Math.min(210,Math.floor(h*.6)))})};
+    async function destroyScanner(){
+      if(scanner){
+        if(running){try{await scanner.stop();}catch(e){}}
+        try{await scanner.clear();}catch(e){}
+      }
+      scanner=null;running=false;
+    }
+    async function stop(silent=false){
+      await destroyScanner();
+      starting=false;
+      setButtons();
+      if(!silent)feedback('Cámara detenida.','');
     }
     async function start(){
       if(starting||running)return;
@@ -87,34 +143,67 @@
       if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){feedback('Necesitas abrir esta página en HTTPS y autorizar la cámara.','error');return;}
       if(typeof Html5Qrcode==='undefined'){feedback('No se pudo cargar el lector de códigos. Comprueba tu conexión a Internet.','error');return;}
       starting=true;setButtons();feedback('Solicitando acceso a la cámara...','');
+      const choice=cameras.value;
       try{
-        if(scanner){try{await scanner.clear();}catch(e){}}
-        scanner=new Html5Qrcode('reader',{formatsToSupport:[
-          Html5QrcodeSupportedFormats.CODE_128,Html5QrcodeSupportedFormats.CODE_39,
-          Html5QrcodeSupportedFormats.CODE_93,Html5QrcodeSupportedFormats.EAN_13,
-          Html5QrcodeSupportedFormats.EAN_8,Html5QrcodeSupportedFormats.UPC_A,
-          Html5QrcodeSupportedFormats.UPC_E,Html5QrcodeSupportedFormats.ITF,
-          Html5QrcodeSupportedFormats.QR_CODE]});
-        const cam=cameras.value||null;
-        await scanner.start(cam?cam:{facingMode:'environment'},
-          {fps:9,qrbox:(w,h)=>({width:Math.max(150,Math.min(340,Math.floor(w*.8))),height:Math.max(110,Math.min(210,Math.floor(h*.6)))})},
-          success,notFound);
-        running=true;feedback('Cámara activa. Acerca el código al recuadro.','success');
+        await destroyScanner();
+        scanner=newScanner();
         try{
-          const found=await Html5Qrcode.getCameras();
-          if(found&&found.length){
-            const selected=cameras.value;
-            cameras.innerHTML='<option value="">Cámara trasera (predeterminada)</option>';
-            found.forEach(x=>{const opt=document.createElement('option');opt.value=x.id;opt.textContent=x.label||('Cámara '+(cameras.options.length));cameras.appendChild(opt);});
-            if(selected)cameras.value=selected;
-          }
-        }catch(e){}
-      }catch(e){feedback('No se pudo iniciar la cámara: '+String(e?.message||e)+'. Comprueba los permisos o elige otra cámara.','error');}
-      finally{starting=false;setButtons();}
+          await scanner.start(cameraRequest(choice),scanOptions,success,notFound);
+        }catch(firstError){
+          // En algunos equipos "environment" no abre la cámara real: intentar
+          // por identificador concreto, siempre liberando antes el intento fallido.
+          const backup=choice==='rear'?backDevices()[0]:null;
+          if(!backup)throw firstError;
+          await destroyScanner();
+          await wait(400);
+          scanner=newScanner();
+          await scanner.start(backup.deviceId,scanOptions,success,notFound);
+          cameras.value='id:'+backup.deviceId;
+        }
+        running=true;
+        // Esta llamada únicamente ENUMERA dispositivos. No hay otro getUserMedia.
+        await refreshDevices();
+        const video=$('reader').querySelector('video');
+        if(video){
+          video.muted=true;video.setAttribute('playsinline','');
+          try{await video.play();}catch(e){}
+        }
+        feedback('Cámara activa. Si la imagen está negra, pulsa «Reparar imagen negra» o elige otra cámara trasera.','success');
+      }catch(e){
+        await destroyScanner();
+        feedback('No se pudo iniciar la cámara: '+String(e?.message||e)+'. Comprueba los permisos o elige otra cámara.','error');
+      }finally{starting=false;setButtons();}
+    }
+    async function restart(){
+      if(changing||starting)return;
+      changing=true;setButtons();
+      try{
+        await stop(true);
+        // Algunos móviles conservan bloqueado el sensor unas décimas tras stop().
+        await wait(500);
+        await start();
+      }finally{changing=false;setButtons();}
+    }
+    async function repair(){
+      if(!running||changing||starting)return;
+      // Si «trasera (automática)» falla, pasar a cámara posterior REAL por ID.
+      // Otros intentos recorren las traseras físicas disponibles.
+      const rear=backDevices();
+      const current=cameras.value;
+      if((current==='rear'||current.startsWith('id:'))&&rear.length){
+        const currentId=current.startsWith('id:')?current.slice(3):'';
+        const choices=rear.filter(d=>d.deviceId!==currentId);
+        const alternative=choices[repairIndex%Math.max(choices.length,1)]||rear[0];
+        repairIndex++;
+        cameras.value='id:'+alternative.deviceId;
+      }
+      feedback('Liberando la cámara y recuperando imagen...','');
+      await restart();
     }
     buttonStart.addEventListener('click',start);
-    buttonStop.addEventListener('click',stop);
-    cameras.addEventListener('change',async()=>{if(running){await stop();await start();}});
+    buttonStop.addEventListener('click',()=>stop());
+    buttonRepair.addEventListener('click',repair);
+    cameras.addEventListener('change',()=>{repairIndex=0;if(running)restart();});
     repeat.addEventListener('click',()=>{if(lastRaw&&!pending)report(lastRaw,true);});
     window.addEventListener('message',event=>{
       if(event.source!==window.opener)return;
