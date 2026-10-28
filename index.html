@@ -15,7 +15,17 @@
     h1{font-size:22px;line-height:1.2;margin:7px 0}
     .head p{font-size:13px;line-height:1.5;color:#e0efff;margin:0}
     .panel{background:#fff;border:1px solid #dfe7f2;padding:15px;border-radius:14px;box-shadow:0 8px 28px rgba(15,34,63,.05);margin-bottom:12px}
-    #reader{width:100%;min-height:200px;border-radius:11px;overflow:hidden;background:#07172b;display:flex;align-items:center;justify-content:center;color:#c4d5e5}
+    .camera-stage{position:relative;isolation:isolate;border-radius:11px;overflow:hidden;background:#07172b}
+    #reader{width:100%;min-height:200px;overflow:hidden;background:#07172b;display:flex;align-items:center;justify-content:center;color:#c4d5e5}
+    .scan-confirm{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;pointer-events:none;opacity:0;transform:scale(.94);transition:opacity .09s ease,transform .09s ease;visibility:hidden}
+    .scan-confirm.show{opacity:1;transform:scale(1);visibility:visible}
+    .scan-confirm__circle{width:82px;height:82px;border:3px solid #b6fbd1;border-radius:50%;display:grid;place-items:center;color:#fff;background:#19a95b;box-shadow:0 0 0 7px rgba(22,163,74,.2),0 7px 24px rgba(0,0,0,.28)}
+    .scan-confirm__circle svg{width:48px;height:48px;stroke:#fff;stroke-width:7;stroke-linecap:round;stroke-linejoin:round;fill:none}
+    .scan-confirm__label{max-width:85%;padding:5px 12px;border-radius:99px;background:rgba(8,43,27,.85);color:#fff;text-align:center;font-weight:800;font-size:13px;overflow-wrap:anywhere}
+    .scan-confirm.show .scan-confirm__circle{animation:scan-bounce .22s ease-out}
+    @keyframes scan-bounce{0%{transform:scale(.65)}75%{transform:scale(1.08)}100%{transform:scale(1)}}
+    @media(prefers-reduced-motion:reduce){.scan-confirm,.scan-confirm.show .scan-confirm__circle{transition:none;animation:none}}
+
     #reader video{object-fit:contain!important;max-width:100%;max-height:100%}
     .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin:12px 0}
     button,select{border:1px solid #cad7e8;border-radius:9px;font-size:14px;padding:11px 14px;background:#f5f8fc;color:#142840;min-height:42px}
@@ -37,12 +47,19 @@
   <main class="wrap">
     <div class="head"><small>INTELSI · INVENTARIO</small><h1>📹 Escanear con cámara</h1><p>Escanea códigos de barras o QR. Cada lectura se envía a la lista temporal de Inventario, sin modificar stock hasta que guardes en el sistema.</p></div>
     <section class="panel">
-      <div id="reader">La cámara se activará al pulsar «Iniciar».</div>
+      <div class="camera-stage">
+        <div id="reader">La cámara se activará al pulsar «Iniciar».</div>
+        <div id="scanConfirm" class="scan-confirm" aria-hidden="true">
+          <div class="scan-confirm__circle"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="M10 24l10 10 19-21"/></svg></div>
+          <div class="scan-confirm__label">✓ Producto agregado</div>
+        </div>
+      </div>
       <div class="row">
         <button class="primary" id="start" type="button">▶ Iniciar cámara</button>
         <button id="stop" type="button" disabled>■ Detener</button>
         <select id="cameras" aria-label="Seleccionar cámara" title="Seleccionar cámara"><option value="rear">📷 Trasera (automática)</option><option value="front">🤳 Frontal</option></select>
         <button id="repair" type="button" disabled>↻ Reparar imagen negra</button>
+        <button id="sound" type="button" aria-pressed="true" title="Activar o silenciar el pitido">🔊 Sonido activado</button>
       </div>
       <div id="status" role="status" aria-live="polite">Para usar la cámara debes permitir su acceso en este navegador.</div>
       <div class="last"><div><div class="hint">Última lectura</div><div id="lastCode">—</div></div><button id="repeat" type="button" disabled>＋ Repetir código</button></div>
@@ -57,9 +74,47 @@
     const params=new URLSearchParams(location.search),token=params.get('intelsiSession')||'';
     const $=(id)=>document.getElementById(id);
     const buttonStart=$('start'),buttonStop=$('stop'),buttonRepair=$('repair'),repeat=$('repeat'),cameras=$('cameras');
-    const status=$('status'),last=$('lastCode');
+    const status=$('status'),last=$('lastCode'),confirmOverlay=$('scanConfirm'),soundButton=$('sound');
     let scanner=null,running=false,starting=false,changing=false,lastSeen=0,lastSent=0,locked='',pending=false,lastRaw='',sentCount=0;
     let availableCameras=[],repairIndex=0;
+    let audioContext=null,confirmTimer=null;
+    let soundOn=true;
+    try{soundOn=localStorage.getItem('INTELSI_INV_CAMERA_SOUND')!=='off';}catch(_){}
+    function refreshSoundButton(){soundButton.textContent=soundOn?'🔊 Sonido activado':'🔇 Sonido silenciado';soundButton.setAttribute('aria-pressed',String(soundOn));}
+    // El contexto de audio debe activarse desde un clic real del usuario.
+    function prepareAudio(){
+      if(!soundOn)return;
+      try{
+        const AudioCtor=window.AudioContext||window.webkitAudioContext;
+        if(!AudioCtor)return;
+        if(!audioContext)audioContext=new AudioCtor();
+        if(audioContext.state==='suspended')audioContext.resume().catch(()=>{});
+      }catch(_){} // El fallo de audio nunca interrumpe el escaneo.
+    }
+    function beep(){
+      if(!soundOn||!audioContext||audioContext.state!=='running')return;
+      try{
+        const oscillator=audioContext.createOscillator();
+        const gain=audioContext.createGain();
+        const t=audioContext.currentTime;
+        oscillator.type='sine';oscillator.frequency.setValueAtTime(940,t);
+        gain.gain.setValueAtTime(.0001,t);
+        gain.gain.exponentialRampToValueAtTime(.14,t+.012);
+        gain.gain.exponentialRampToValueAtTime(.0001,t+.12);
+        oscillator.connect(gain);gain.connect(audioContext.destination);
+        oscillator.start(t);oscillator.stop(t+.125);
+        oscillator.onended=()=>{try{oscillator.disconnect();gain.disconnect();}catch(_){}};
+      }catch(_){}
+    }
+    function flashAccepted(){
+      clearTimeout(confirmTimer);
+      confirmOverlay.classList.remove('show');
+      // Reinicia la animación también cuando llegan lecturas válidas consecutivas.
+      void confirmOverlay.offsetWidth;
+      confirmOverlay.classList.add('show');
+      confirmTimer=setTimeout(()=>confirmOverlay.classList.remove('show'),400);
+      beep();
+    }
     const codeKey=(value)=>String(value||'').trim().replace(/['\u2018\u2019]/g,'-').toUpperCase();
     const wait=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
     function feedback(text,type){status.className=type||'';status.textContent=String(text||'');}
@@ -200,7 +255,13 @@
       feedback('Liberando la cámara y recuperando imagen...','');
       await restart();
     }
-    buttonStart.addEventListener('click',start);
+    buttonStart.addEventListener('click',()=>{prepareAudio();start();});
+    soundButton.addEventListener('click',()=>{
+      soundOn=!soundOn;
+      try{localStorage.setItem('INTELSI_INV_CAMERA_SOUND',soundOn?'on':'off');}catch(_){}
+      refreshSoundButton();
+      if(soundOn)prepareAudio();
+    });
     buttonStop.addEventListener('click',()=>stop());
     buttonRepair.addEventListener('click',repair);
     cameras.addEventListener('change',()=>{repairIndex=0;if(running)restart();});
@@ -209,11 +270,15 @@
       if(event.source!==window.opener)return;
       const msg=event.data;
       if(!msg||msg.type!=='INTELSI_INV_CAMERA_ACK_V1'||msg.token!==token)return;
+      // Confirmar únicamente después de que Inventario reporte que agregó el producto.
+      // No hay sonido ni animación en rechazos, duplicados o códigos no existentes.
+      const wasPending=pending;
       pending=false;sentCount+=msg.ok?1:0;
+      if(msg.ok===true&&wasPending)flashAccepted();
       feedback(msg.message+(msg.ok?' · Escaneos añadidos: '+sentCount:''),msg.ok?'success':'error');setButtons();
     });
     window.addEventListener('pagehide',()=>{try{if(scanner&&running)scanner.stop();}catch(e){}});
-    setButtons();if(!window.opener||!/^[a-f0-9]{48}$/i.test(token))feedback('Esta página debe abrirse desde Inventario.','error');
+    refreshSoundButton();setButtons();if(!window.opener||!/^[a-f0-9]{48}$/i.test(token))feedback('Esta página debe abrirse desde Inventario.','error');
   })();
   </script>
 </body>
